@@ -2,7 +2,15 @@
 
 > **A production-ready, privacy-first automation system that formats research manuscripts for IEEE journal submission — with interactive in-text hyperlinks, hover tooltips, multi-database reference verification, and strict word-for-word text preservation.**
 
+[![Live Web App](https://img.shields.io/badge/Live%20Demo-Render-46E3B7?style=for-the-badge&logo=render&logoColor=white)](https://ieee-citation-automation-system.onrender.com/)
+[![GitHub Repo](https://img.shields.io/badge/GitHub-Repository-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/yasirali7212/IEEE-Citation-Automation-System)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
+
+🌐 **Live Application URL:** [https://ieee-citation-automation-system.onrender.com/](https://ieee-citation-automation-system.onrender.com/)
+
 ---
+
 
 ## 📑 Table of Contents
 
@@ -227,21 +235,28 @@ d:\bot\
 
 You can host this application online so your entire research team or lab can format papers from anywhere.
 
-### Deploy to Render
+### Live Deployment on Render
 
-1. Push this repository to your GitHub account:
+The system is deployed and publicly accessible on Render's free tier:  
+👉 **[https://ieee-citation-automation-system.onrender.com/](https://ieee-citation-automation-system.onrender.com/)**
+
+### Deploy Your Own Instance to Render
+
+1. Fork or push this repository to your GitHub account:
    ```bash
-   git remote add origin https://github.com/<your-username>/ieee-citation-workflow.git
+   git remote add origin https://github.com/yasirali7212/IEEE-Citation-Automation-System.git
    git branch -M main
    git push -u origin main
    ```
 2. Log in to [Render.com](https://render.com) and click **New + -> Web Service**.
-3. Select your repository.
+3. Connect your repository (`yasirali7212/IEEE-Citation-Automation-System`).
 4. Render will automatically detect [`render.yaml`](file:///d:/bot/render.yaml):
    - **Environment:** Python
    - **Build Command:** `pip install -r requirements.txt`
    - **Start Command:** `gunicorn --bind 0.0.0.0:$PORT server.app:app --timeout 600 --workers 2`
+   - **Plan:** Free ($0/month)
 5. Click **Create Web Service**. Your service will be live on a free public HTTPS URL in under 2 minutes!
+
 
 ### Deploy with Docker
 
