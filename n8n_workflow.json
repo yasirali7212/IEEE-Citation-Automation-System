@@ -1,0 +1,230 @@
+{
+  "name": "IEEE Citation Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ieee-citation-workflow",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "n001",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "notes": "Entry point. Called by the Flask server when a job starts.\nReceives: job_id, paper_path, template_path, output_dir"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Node 2: Input File Validation ────────────────────────────────────\n// Validates required fields from the webhook body.\n// Returns an error early if required files are missing.\n\nconst body = $input.first().json;\nconst jobId = body.job_id;\nconst paperPath = body.paper_path;\nconst outputDir = body.output_dir;\n\nif (!jobId) throw new Error('Missing job_id in request body');\nif (!paperPath) throw new Error('Missing paper_path in request body');\nif (!outputDir) throw new Error('Missing output_dir in request body');\n\n// Pass validated data to next nodes\nreturn [{\n  json: {\n    job_id: jobId,\n    paper_path: paperPath,\n    template_path: body.template_path || null,\n    output_dir: outputDir,\n    validated: true,\n    timestamp: new Date().toISOString(),\n  }\n}];"
+      },
+      "id": "n002",
+      "name": "Input File Validation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300],
+      "notes": "Validates that job_id, paper_path, and output_dir are present.\nSafe early exit before any processing begins."
+    },
+    {
+      "parameters": {
+        "command": "=python \"d:\\\\bot\\\\scripts\\\\extract_document.py\" \"{{ $json.paper_path }}\" \"{{ $json.output_dir }}\""
+      },
+      "id": "n003",
+      "name": "Stage A — Extract Document",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [680, 300],
+      "notes": "Runs extract_document.py.\nOutputs: extraction.json and Original_Research_Paper_Backup.docx\nNEVER modifies the source document."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Check Stage A exit code ──────────────────────────────────────────\nconst result = $input.first().json;\nconst exitCode = result.exitCode;\nconst stderr = result.stderr || '';\n\nif (exitCode !== 0) {\n  throw new Error(\n    `Stage A (Extract Document) failed with exit code ${exitCode}.\\n${stderr}`\n  );\n}\n\nreturn [{ json: { ...result, stage_a_ok: true } }];"
+      },
+      "id": "n003b",
+      "name": "Check Stage A",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 300]
+    },
+    {
+      "parameters": {
+        "command": "=python \"d:\\\\bot\\\\scripts\\\\zotero_client.py\" \"{{ $json.output_dir }}\""
+      },
+      "id": "n004",
+      "name": "Stage B1 — Fetch Zotero Library",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [1100, 200],
+      "notes": "Fetches your Zotero library via the Web API.\nOutputs: zotero_library.json\nCredentials loaded from environment — never hardcoded."
+    },
+    {
+      "parameters": {
+        "command": "=python \"d:\\\\bot\\\\scripts\\\\verify_references.py\" \"{{ $json.output_dir }}\""
+      },
+      "id": "n005",
+      "name": "Stage B2 — Verify References Online",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [1100, 400],
+      "notes": "Verifies each reference against Zotero, Crossref, and Semantic Scholar.\nOutputs: verified_references.json\nUnverifiable references are FLAGGED, never silently accepted."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Merge Stage B1 and B2 results ───────────────────────────────────\n// Both Zotero fetch and online verification run in parallel.\n// This node merges their outputs before proceeding.\n\nconst results = $input.all();\nconst anyFailed = results.some(r => r.json.exitCode && r.json.exitCode !== 0);\nif (anyFailed) {\n  const failed = results.find(r => r.json.exitCode !== 0);\n  throw new Error(\n    `A verification stage failed: ${failed.json.stderr || 'Unknown error'}`\n  );\n}\n\nreturn [{ json: { ...results[0].json, verification_complete: true } }];"
+      },
+      "id": "n005b",
+      "name": "Merge Verification Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 300]
+    },
+    {
+      "parameters": {
+        "command": "=python \"d:\\\\bot\\\\scripts\\\\match_citations.py\" \"{{ $json.output_dir }}\""
+      },
+      "id": "n006",
+      "name": "Stage C+D — Map and Renumber Citations",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [1540, 300],
+      "notes": "Stages C & D combined.\nMaps each [N] to its verified reference.\nRenumbers by first appearance (IEEE rule).\nOutputs: citation_map.json"
+    },
+    {
+      "parameters": {
+        "jsCode": "const result = $input.first().json;\nif (result.exitCode !== 0) {\n  throw new Error(\n    `Stage C+D (Citation Mapping) failed: ${result.stderr || ''}`\n  );\n}\nreturn [{ json: { ...result, mapping_complete: true } }];"
+      },
+      "id": "n006b",
+      "name": "Check Stage C+D",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1760, 300]
+    },
+    {
+      "parameters": {
+        "command": "=python \"d:\\\\bot\\\\scripts\\\\format_citations.py\" \"{{ $json.output_dir }}\" \"{{ $json.paper_path }}\""
+      },
+      "id": "n007",
+      "name": "Stage D+E — Format IEEE Citations",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [1980, 300],
+      "notes": "Applies ONLY citation-number renumbering to the document.\nWrites the IEEE-formatted bibliography.\nOutputs: IEEE_Formatted_Research_Paper.docx\nNEVER changes any other text."
+    },
+    {
+      "parameters": {
+        "command": "=python \"d:\\\\bot\\\\scripts\\\\apply_template.py\" \"{{ $json.output_dir }}\" {{ $json.template_path ? '\"' + $json.template_path + '\"' : '' }}"
+      },
+      "id": "n008",
+      "name": "Stage F — Apply Journal Template",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [2200, 300],
+      "notes": "Copies page margins, column layout, and styles from the IEEE template.\nIf no template is provided, applies IEEE default margins.\nNever reorders or rewrites document content."
+    },
+    {
+      "parameters": {
+        "command": "=python \"d:\\\\bot\\\\scripts\\\\validate_document.py\" \"{{ $json.output_dir }}\""
+      },
+      "id": "n009",
+      "name": "Stage G — Validate Text Preservation",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [2420, 300],
+      "notes": "Compares original backup vs final document paragraph by paragraph.\nOutputs: Text_Preservation_Report.txt\nFails loudly if any non-citation text change is detected."
+    },
+    {
+      "parameters": {
+        "command": "=python \"d:\\\\bot\\\\scripts\\\\report_generator.py\" \"{{ $json.output_dir }}\""
+      },
+      "id": "n010",
+      "name": "Generate All Reports",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [2640, 300],
+      "notes": "Generates:\n- Citation_Verification_Report.csv\n- Unresolved_Citations_Report.txt"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Final Quality Checks and Response ───────────────────────────────\nconst result = $input.first().json;\n\n// Collect all expected outputs\nconst expectedFiles = [\n  'IEEE_Formatted_Research_Paper.docx',\n  'Original_Research_Paper_Backup.docx',\n  'Citation_Verification_Report.csv',\n  'Text_Preservation_Report.txt',\n  'Unresolved_Citations_Report.txt',\n];\n\nconst outputDir = result.output_dir;\nconst timestamp = new Date().toISOString();\n\nreturn [{\n  json: {\n    status: 'complete',\n    job_id: result.job_id,\n    timestamp,\n    output_dir: outputDir,\n    expected_files: expectedFiles,\n    message: (\n      'Processing complete. Review Unresolved_Citations_Report.txt before ' +\n      'submitting. Check Text_Preservation_Report.txt to confirm original ' +\n      'text was not modified.'\n    )\n  }\n}];"
+      },
+      "id": "n011",
+      "name": "Final Quality Checks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2860, 300],
+      "notes": "Final node: assembles the completion response.\nReturns status, output file list, and a reminder to review unresolved citations."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}"
+      },
+      "id": "n012",
+      "name": "Return Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [3080, 300],
+      "notes": "Sends the final JSON response back to the caller (Flask server)."
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [[ { "node": "Input File Validation", "type": "main", "index": 0 } ]]
+    },
+    "Input File Validation": {
+      "main": [[ { "node": "Stage A — Extract Document", "type": "main", "index": 0 } ]]
+    },
+    "Stage A — Extract Document": {
+      "main": [[ { "node": "Check Stage A", "type": "main", "index": 0 } ]]
+    },
+    "Check Stage A": {
+      "main": [
+        [ { "node": "Stage B1 — Fetch Zotero Library", "type": "main", "index": 0 } ],
+        [ { "node": "Stage B2 — Verify References Online", "type": "main", "index": 0 } ]
+      ]
+    },
+    "Stage B1 — Fetch Zotero Library": {
+      "main": [[ { "node": "Merge Verification Results", "type": "main", "index": 0 } ]]
+    },
+    "Stage B2 — Verify References Online": {
+      "main": [[ { "node": "Merge Verification Results", "type": "main", "index": 1 } ]]
+    },
+    "Merge Verification Results": {
+      "main": [[ { "node": "Stage C+D — Map and Renumber Citations", "type": "main", "index": 0 } ]]
+    },
+    "Stage C+D — Map and Renumber Citations": {
+      "main": [[ { "node": "Check Stage C+D", "type": "main", "index": 0 } ]]
+    },
+    "Check Stage C+D": {
+      "main": [[ { "node": "Stage D+E — Format IEEE Citations", "type": "main", "index": 0 } ]]
+    },
+    "Stage D+E — Format IEEE Citations": {
+      "main": [[ { "node": "Stage F — Apply Journal Template", "type": "main", "index": 0 } ]]
+    },
+    "Stage F — Apply Journal Template": {
+      "main": [[ { "node": "Stage G — Validate Text Preservation", "type": "main", "index": 0 } ]]
+    },
+    "Stage G — Validate Text Preservation": {
+      "main": [[ { "node": "Generate All Reports", "type": "main", "index": 0 } ]]
+    },
+    "Generate All Reports": {
+      "main": [[ { "node": "Final Quality Checks", "type": "main", "index": 0 } ]]
+    },
+    "Final Quality Checks": {
+      "main": [[ { "node": "Return Response", "type": "main", "index": 0 } ]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "any",
+    "errorWorkflow": "",
+    "timezone": "Asia/Karachi"
+  },
+  "staticData": null,
+  "tags": ["IEEE", "Research", "Citation", "Automation"],
+  "triggerCount": 0,
+  "updatedAt": "2026-10-11T00:00:00.000Z",
+  "versionId": "1"
+}

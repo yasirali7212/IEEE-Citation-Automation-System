@@ -1,0 +1,24 @@
+# Environment variables (NEVER COMMIT SENSITIVE API KEYS)
+.env
+
+# Uploads, outputs and logs
+uploads/
+outputs/
+logs/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary test files
+test_*.docx
+test_*.py
+scratch/

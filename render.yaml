@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: ieee-citation-workflow
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT server.app:app --timeout 600 --workers 2
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: UPLOAD_FOLDER
+        value: uploads
+      - key: OUTPUT_FOLDER
+        value: outputs
+      - key: LOG_FOLDER
+        value: logs
+      - key: ZOTERO_API_KEY
+        sync: false
+      - key: ZOTERO_USER_ID
+        sync: false
+      - key: ZOTERO_LIBRARY_TYPE
+        value: user
+      - key: CROSSREF_EMAIL
+        value: yasirali110a@gmail.com

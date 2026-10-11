@@ -1,0 +1,13 @@
+.env
+uploads/
+outputs/
+logs/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.vscode/
+.idea/
+scratch/
+test_*.docx
+test_*.py
