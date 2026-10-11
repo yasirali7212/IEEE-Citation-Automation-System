@@ -81,10 +81,14 @@ def run_pipeline_locally(job_id: str, paper_path: str,
     od = str(job_output_dir)
 
     sub_env = os.environ.copy()
+    # Strip any server-wide Zotero credentials for complete multi-user isolation
+    sub_env.pop("ZOTERO_API_KEY", None)
+    sub_env.pop("ZOTERO_USER_ID", None)
     if custom_zotero_key:
         sub_env["ZOTERO_API_KEY"] = custom_zotero_key
     if custom_zotero_id:
         sub_env["ZOTERO_USER_ID"] = custom_zotero_id
+
 
     stages = [
         ("Extracting document...",
@@ -270,16 +274,44 @@ def health():
     return jsonify({"status": "ok", "n8n_webhook": N8N_WEBHOOK})
 
 
-@app.route("/api/zotero-status")
-def zotero_status():
-    """Return Zotero configuration status."""
-    api_key = os.getenv("ZOTERO_API_KEY", "")
-    user_id = os.getenv("ZOTERO_USER_ID", "")
-    return jsonify({
-        "configured": bool(api_key and user_id),
-        "user_id": user_id,
-        "masked_key": f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else ("Set" if api_key else "Not set"),
-    })
+@app.route("/api/validate-zotero", methods=["POST"])
+def validate_zotero():
+    """Verify a user's private Zotero key and return their user ID & library name."""
+    body = request.get_json(silent=True) or {}
+    key = body.get("api_key", "").strip()
+    if not key:
+        return jsonify({"valid": False, "error": "Please enter an API key to test."})
+
+    try:
+        import requests
+        res = requests.get(
+            f"https://api.zotero.org/keys/{key}",
+            headers={"Zotero-API-Version": "3"},
+            timeout=8
+        )
+        if res.status_code == 200:
+            data = res.json()
+            user_id = str(data.get("userID", ""))
+            username = data.get("username", "")
+            return jsonify({
+                "valid": True,
+                "user_id": user_id,
+                "username": username,
+                "message": f"Verified! Connected to Zotero (User ID: {user_id})"
+            })
+        elif res.status_code in (401, 403):
+            return jsonify({
+                "valid": False,
+                "error": "Invalid API key or key lacks library read permission."
+            })
+        else:
+            return jsonify({
+                "valid": False,
+                "error": f"Zotero API error (status {res.status_code})"
+            })
+    except Exception as e:
+        return jsonify({"valid": False, "error": f"Connection error: {str(e)}"})
+
 
 
 # ── HTML Page (self-contained) ────────────────────────────────────────────────
@@ -730,36 +762,46 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Zotero status -->
-    <div style="margin-bottom:1.5rem;">
-      <label style="font-size:0.82rem;font-weight:500;color:var(--text2);display:block;margin-bottom:0.5rem;">
-        Zotero Library
-      </label>
-      <div class="zotero-info">
-        <div class="zotero-status" id="zotero-status-line">
-          <div class="status-dot"></div>
-          Checking Zotero connection...
-        </div>
-        <div id="zotero-status-desc">
-          Connecting to your Zotero library...
-        </div>
+    <!-- Zotero connection section -->
+    <div style="margin-bottom:1.5rem;background:rgba(255,255,255,0.02);border:1px solid var(--border);border-radius:0.75rem;padding:1.25rem;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.75rem;flex-wrap:wrap;gap:0.5rem;">
+        <label style="font-size:0.88rem;font-weight:600;color:var(--text);display:flex;align-items:center;gap:0.5rem;">
+          <span>📚</span> Connect Your Own Zotero Library <span style="font-size:0.75rem;color:var(--text3);font-weight:400;">(Optional)</span>
+        </label>
+        <a href="https://www.zotero.org/settings/keys" target="_blank" rel="noopener" style="font-size:0.78rem;color:var(--accent);text-decoration:none;">
+          Get Free Read-Only Key ↗
+        </a>
       </div>
-    <!-- Optional custom Zotero inputs for external users -->
-    <details style="margin-bottom:1.5rem;background:rgba(255,255,255,0.02);border:1px solid var(--border);border-radius:0.75rem;padding:0.75rem 1rem;">
-      <summary style="font-size:0.85rem;color:var(--text2);cursor:pointer;font-weight:500;">
-        ⚙️ Use your own Zotero credentials (optional)
-      </summary>
-      <div style="margin-top:0.75rem;display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;">
+      <p style="font-size:0.8rem;color:var(--text2);margin-bottom:1rem;line-height:1.5;">
+        <strong>Multi-User Privacy:</strong> No personal credentials are saved on this server. Each user connects their own Zotero account. Your API key is used strictly in-memory during processing and wiped immediately after. If you leave this blank, references will be verified automatically using <strong>Crossref &amp; Semantic Scholar</strong>.
+      </p>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;">
         <div>
-          <label style="font-size:0.75rem;color:var(--text3);display:block;margin-bottom:0.25rem;">Zotero API Key</label>
-          <input type="password" id="custom-zotero-key" placeholder="Leave blank to use default" style="width:100%;padding:0.5rem;background:var(--surface2);border:1px solid var(--border);border-radius:0.4rem;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:0.8rem;">
+          <label style="font-size:0.75rem;color:var(--text3);display:block;margin-bottom:0.35rem;font-weight:500;">Your Zotero API Key</label>
+          <input type="password" id="custom-zotero-key" placeholder="Paste your private Zotero API key..." style="width:100%;padding:0.6rem;background:var(--surface2);border:1px solid var(--border);border-radius:0.5rem;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:0.8rem;">
         </div>
         <div>
-          <label style="font-size:0.75rem;color:var(--text3);display:block;margin-bottom:0.25rem;">Numeric User ID</label>
-          <input type="text" id="custom-zotero-id" placeholder="Leave blank to use default" style="width:100%;padding:0.5rem;background:var(--surface2);border:1px solid var(--border);border-radius:0.4rem;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:0.8rem;">
+          <label style="font-size:0.75rem;color:var(--text3);display:block;margin-bottom:0.35rem;font-weight:500;">Numeric User ID</label>
+          <input type="text" id="custom-zotero-id" placeholder="Optional: auto-detected if left blank" style="width:100%;padding:0.6rem;background:var(--surface2);border:1px solid var(--border);border-radius:0.5rem;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:0.8rem;">
         </div>
       </div>
-    </details>
+      <div style="margin-top:0.75rem;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;">
+        <div style="display:flex;align-items:center;gap:0.5rem;">
+          <button type="button" onclick="testZoteroKey()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);font-size:0.75rem;padding:0.35rem 0.75rem;border-radius:0.35rem;cursor:pointer;font-weight:500;display:flex;align-items:center;gap:0.35rem;">
+            <span>🔍</span> Test Connection
+          </button>
+          <span id="zotero-test-status" style="font-size:0.75rem;display:none;"></span>
+        </div>
+        <label style="font-size:0.75rem;color:var(--text3);display:flex;align-items:center;gap:0.35rem;cursor:pointer;user-select:none;">
+          <input type="checkbox" id="remember-zotero-key" onchange="toggleRememberKey()" style="accent-color:var(--accent);">
+          <span>Remember key in my browser only (local storage)</span>
+        </label>
+      </div>
+      <div style="font-size:0.73rem;color:var(--text3);margin-top:0.65rem;display:flex;align-items:center;gap:0.4rem;">
+        <span>🔒</span> Zero server retention. Each user's private key remains strictly isolated.
+      </div>
+    </div>
+
 
     <!-- Run button -->
     <button class="btn-run" id="run-btn" onclick="startWorkflow()">
@@ -883,23 +925,83 @@ const FILE_DESCRIPTIONS = {
   'references.ris': {icon:'📑', desc:'EndNote & Zotero RIS export file — ready for any citation manager.'},
 };
 
-// ── Check Zotero Connection on Load ──
-async function checkZoteroStatus() {
+// ── Privacy & Zotero Key Management ──
+function initZoteroPreferences() {
   try {
-    const res = await fetch('/api/zotero-status');
-    const data = await res.json();
-    const line = document.getElementById('zotero-status-line');
-    const desc = document.getElementById('zotero-status-desc');
-    if (data.configured) {
-      line.innerHTML = `<div class="status-dot" style="background:var(--success);box-shadow:0 0 8px var(--success)"></div><span style="color:var(--success);font-weight:600;">Zotero Library Connected</span> (User ID: ${data.user_id})`;
-      if (desc) desc.innerHTML = `Your Zotero library is linked! All imported papers will automatically be verified and matched with in-text citations.`;
-    } else {
-      line.innerHTML = `<div class="status-dot" style="background:var(--warning)"></div>Zotero Not Configured (Optional)`;
-      if (desc) desc.innerHTML = `Set <code style="color:var(--accent)">ZOTERO_API_KEY</code> and <code style="color:var(--accent)">ZOTERO_USER_ID</code> in <strong>.env</strong> to auto-match your library.`;
+    const savedKey = localStorage.getItem('user_zotero_key');
+    const savedId = localStorage.getItem('user_zotero_id');
+    const rememberCheckbox = document.getElementById('remember-zotero-key');
+    const keyInput = document.getElementById('custom-zotero-key');
+    const idInput = document.getElementById('custom-zotero-id');
+
+    if (savedKey) {
+      if (keyInput) keyInput.value = savedKey;
+      if (idInput && savedId) idInput.value = savedId;
+      if (rememberCheckbox) rememberCheckbox.checked = true;
     }
   } catch (e) {}
 }
-window.addEventListener('DOMContentLoaded', checkZoteroStatus);
+
+function toggleRememberKey() {
+  const rememberCheckbox = document.getElementById('remember-zotero-key');
+  const keyInput = document.getElementById('custom-zotero-key');
+  const idInput = document.getElementById('custom-zotero-id');
+  if (rememberCheckbox && !rememberCheckbox.checked) {
+    try {
+      localStorage.removeItem('user_zotero_key');
+      localStorage.removeItem('user_zotero_id');
+    } catch (e) {}
+  } else if (rememberCheckbox && rememberCheckbox.checked) {
+    try {
+      if (keyInput?.value?.trim()) localStorage.setItem('user_zotero_key', keyInput.value.trim());
+      if (idInput?.value?.trim()) localStorage.setItem('user_zotero_id', idInput.value.trim());
+    } catch (e) {}
+  }
+}
+
+async function testZoteroKey() {
+  const keyInput = document.getElementById('custom-zotero-key');
+  const idInput = document.getElementById('custom-zotero-id');
+  const statusEl = document.getElementById('zotero-test-status');
+  const key = keyInput?.value?.trim();
+
+  if (!key) {
+    statusEl.style.display = 'inline-block';
+    statusEl.style.color = 'var(--warning)';
+    statusEl.innerHTML = '⚠️ Enter a key first (or leave blank to use Crossref).';
+    return;
+  }
+
+  statusEl.style.display = 'inline-block';
+  statusEl.style.color = 'var(--text3)';
+  statusEl.innerHTML = '⏳ Testing connection...';
+
+  try {
+    const res = await fetch('/api/validate-zotero', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: key })
+    });
+    const data = await res.json();
+    if (data.valid) {
+      statusEl.style.color = 'var(--success)';
+      statusEl.innerHTML = `✓ Connected! (User ID: ${data.user_id})`;
+      if (idInput && !idInput.value.trim()) {
+        idInput.value = data.user_id;
+      }
+      toggleRememberKey();
+    } else {
+      statusEl.style.color = 'var(--error)';
+      statusEl.innerHTML = `✕ ${data.error || 'Connection failed'}`;
+    }
+  } catch (err) {
+    statusEl.style.color = 'var(--error)';
+    statusEl.innerHTML = `✕ Test failed: ${err.message}`;
+  }
+}
+
+window.addEventListener('DOMContentLoaded', initZoteroPreferences);
+
 
 // ── Drag & drop setup ──
 ['paper', 'template'].forEach(type => {
@@ -947,6 +1049,8 @@ async function startWorkflow() {
   const customId = document.getElementById('custom-zotero-id')?.value?.trim();
   if (customKey) formData.append('zotero_api_key', customKey);
   if (customId) formData.append('zotero_user_id', customId);
+  toggleRememberKey();
+
 
   try {
     const res = await fetch('/api/upload', { method: 'POST', body: formData });

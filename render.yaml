@@ -15,11 +15,6 @@ services:
         value: outputs
       - key: LOG_FOLDER
         value: logs
-      - key: ZOTERO_API_KEY
-        sync: false
-      - key: ZOTERO_USER_ID
-        sync: false
-      - key: ZOTERO_LIBRARY_TYPE
-        value: user
       - key: CROSSREF_EMAIL
-        value: yasirali110a@gmail.com
+        value: citation-workflow@research-paper.org
+

@@ -201,11 +201,21 @@ if __name__ == "__main__":
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     out_path = str(Path(output_dir) / "zotero_library.json")
 
+    api_key = os.getenv("ZOTERO_API_KEY", "").strip()
+    if not api_key:
+        logger.info("No Zotero API key provided. Saving empty index; online Crossref/Semantic Scholar search will be used.")
+        with open(out_path, 'w', encoding='utf-8') as f:
+            f.write("{}")
+        print("Skipped Zotero: No API key provided (using online verification).")
+        sys.exit(0)
+
     try:
         client = ZoteroClient()
         save_zotero_library(out_path, client)
         print(f"Zotero library saved to: {out_path}")
-    except ValueError as e:
-        print(f"Configuration error: {e}")
-        print("Please set ZOTERO_API_KEY and ZOTERO_USER_ID in your .env file.")
-        sys.exit(1)
+    except Exception as e:
+        logger.warning(f"Zotero connection failed: {e}. Proceeding with online search.")
+        with open(out_path, 'w', encoding='utf-8') as f:
+            f.write("{}")
+        print("Zotero lookup skipped; continuing with online verification.")
+        sys.exit(0)
