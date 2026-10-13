@@ -1,10 +1,12 @@
 # Environment variables (NEVER COMMIT SENSITIVE API KEYS)
 .env
 
-# Uploads, outputs and logs
+# Uploads, outputs, logs, and database
 uploads/
 outputs/
 logs/
+data/
+*.db
 
 # Python bytecode and caches
 __pycache__/

@@ -1,11 +1,13 @@
 """
 Flask Web Server — IEEE Citation Workflow Interface
 ====================================================
-Provides a simple web interface to:
-  - Upload research paper and IEEE template
-  - Trigger the n8n workflow via webhook
-  - Show processing progress
-  - Download output files
+Provides an enterprise-grade academic automation web interface to:
+  - Securely authenticate users (Signup, Login, Sessions)
+  - Safely isolate personal Zotero API credentials per researcher
+  - Upload research manuscripts (.docx) and optional IEEE templates
+  - Trigger multi-database reference verification & citation renumbering
+  - Track live progress with real-time stage milestones
+  - Download submission-ready Word manuscripts, reports & ZIP bundles
 
 Runs on http://localhost:8080 by default.
 """
@@ -18,23 +20,35 @@ import subprocess
 import sys
 import time
 import uuid
+import zipfile
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
-from flask import (Flask, jsonify, render_template_string,
-                   request, send_file, send_from_directory)
+from flask import (Flask, jsonify, render_template, request,
+                   send_file, session)
 from flask_cors import CORS
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+try:
+    from server.db import (init_db, create_user, authenticate_user,
+                           get_user_by_id, update_user_zotero,
+                           record_user_job, update_job_status, get_user_jobs)
+except ImportError:
+    from db import (init_db, create_user, authenticate_user,
+                    get_user_by_id, update_user_zotero,
+                    record_user_job, update_job_status, get_user_jobs)
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
-CORS(app)
-
-BASE_DIR = Path(__file__).parent.parent
+TEMPLATE_DIR = BASE_DIR / "server" / "templates"
+STATIC_DIR = BASE_DIR / "server" / "static"
 UPLOAD_DIR = BASE_DIR / os.getenv("UPLOAD_FOLDER", "uploads")
 OUTPUT_DIR = BASE_DIR / os.getenv("OUTPUT_FOLDER", "outputs")
 LOG_DIR = BASE_DIR / os.getenv("LOG_FOLDER", "logs")
@@ -46,13 +60,23 @@ MAX_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", 50)) * 1024 * 1024
 for d in [UPLOAD_DIR, OUTPUT_DIR, LOG_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
-# ── In-memory job status store ────────────────────────────────────────────────
+# Initialize persistent SQLite database
+init_db()
+
+app = Flask(__name__, template_folder=str(TEMPLATE_DIR), static_folder=str(STATIC_DIR))
+CORS(app)
+
+# Session Security Configuration
+app.secret_key = os.getenv("SECRET_KEY", "ieee-citation-workflow-session-secret-token-2026")
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+# ── In-memory active job store ────────────────────────────────────────────────
 jobs: dict[str, dict] = {}
 
 
 def cleanup_old_jobs(max_age_hours: int = 24) -> None:
     """Delete upload and output directories older than max_age_hours to save disk."""
-    import shutil
     now = time.time()
     for base in [UPLOAD_DIR, OUTPUT_DIR, LOG_DIR]:
         if not base.exists():
@@ -73,22 +97,21 @@ def run_pipeline_locally(job_id: str, paper_path: str,
                           custom_zotero_key: str | None = None,
                           custom_zotero_id: str | None = None) -> None:
     """
-    Run the full Python pipeline locally (without n8n) as a subprocess chain.
-    Updates jobs[job_id] with progress.
-    Supports optional per-user Zotero credentials for multi-user deployment.
+    Run the full Python pipeline locally as an isolated subprocess chain.
+    Updates jobs[job_id] with progress and updates database job status.
+    Supports per-user private Zotero credentials with complete cross-user isolation.
     """
     python = sys.executable
     od = str(job_output_dir)
 
     sub_env = os.environ.copy()
-    # Strip any server-wide Zotero credentials for complete multi-user isolation
+    # Strip any global server Zotero credentials for complete multi-user isolation
     sub_env.pop("ZOTERO_API_KEY", None)
     sub_env.pop("ZOTERO_USER_ID", None)
     if custom_zotero_key:
         sub_env["ZOTERO_API_KEY"] = custom_zotero_key
     if custom_zotero_id:
         sub_env["ZOTERO_USER_ID"] = custom_zotero_id
-
 
     stages = [
         ("Extracting document...",
@@ -131,19 +154,23 @@ def run_pipeline_locally(job_id: str, paper_path: str,
                     f"Stage '{label}' failed (exit {result.returncode}). "
                     f"Last log: {''.join(last_lines)}"
                 )
+                update_job_status(job_id, "error")
                 return
         except subprocess.TimeoutExpired:
             jobs[job_id]["status"] = "error"
             jobs[job_id]["error"] = f"Stage '{label}' timed out after 5 minutes."
+            update_job_status(job_id, "error")
             return
         except Exception as e:
             jobs[job_id]["status"] = "error"
             jobs[job_id]["error"] = f"Stage '{label}' raised exception: {e}"
+            update_job_status(job_id, "error")
             return
 
     jobs[job_id]["progress"] = 100
     jobs[job_id]["status"] = "done"
     jobs[job_id]["stage"] = "Complete"
+    update_job_status(job_id, "done")
 
     # Collect output files
     output_files = []
@@ -190,16 +217,153 @@ def run_pipeline_locally(job_id: str, paper_path: str,
     logger.info(f"[{job_id}] Pipeline complete. Files: {output_files}, Stats: {stats}")
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── Web Application & API Routes ──────────────────────────────────────────────
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_PAGE)
+    """Serve the modern IEEE Citation Automation suite interface."""
+    return render_template("index.html")
 
+
+# ── User Authentication Endpoints ────────────────────────────────────────────
+
+@app.route("/api/auth/signup", methods=["POST"])
+def auth_signup():
+    """Register a new researcher account."""
+    data = request.get_json(silent=True) or {}
+    username = data.get("username", "").strip()
+    password = data.get("password", "")
+    email = data.get("email", "").strip() or None
+    zotero_key = data.get("zotero_api_key", "").strip() or None
+    zotero_id = data.get("zotero_user_id", "").strip() or None
+
+    if not username:
+        return jsonify({"error": "Username is required."}), 400
+    if not password:
+        return jsonify({"error": "Password is required."}), 400
+
+    # Auto-resolve numeric Zotero ID if key provided but no ID
+    if zotero_key and not zotero_id:
+        try:
+            res = requests.get(
+                f"https://api.zotero.org/keys/{zotero_key}",
+                headers={"Zotero-API-Version": "3"},
+                timeout=8
+            )
+            if res.status_code == 200:
+                zotero_id = str(res.json().get("userID", ""))
+        except Exception:
+            pass
+
+    try:
+        user = create_user(
+            username=username,
+            password=password,
+            email=email,
+            zotero_api_key=zotero_key,
+            zotero_user_id=zotero_id,
+        )
+        session["user_id"] = user["id"]
+        session["username"] = user["username"]
+        return jsonify({"user": user, "message": "Account created successfully."}), 201
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Signup error: {e}")
+        return jsonify({"error": "Internal server error during registration."}), 500
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def auth_login():
+    """Authenticate researcher credentials and establish session."""
+    data = request.get_json(silent=True) or {}
+    username = data.get("username", "").strip()
+    password = data.get("password", "")
+
+    if not username or not password:
+        return jsonify({"error": "Both username and password are required."}), 400
+
+    user = authenticate_user(username, password)
+    if not user:
+        return jsonify({"error": "Invalid username or password."}), 401
+
+    session["user_id"] = user["id"]
+    session["username"] = user["username"]
+    return jsonify({"user": user, "message": "Login successful."})
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def auth_logout():
+    """Clear session and log user out."""
+    session.clear()
+    return jsonify({"message": "Logged out successfully."})
+
+
+@app.route("/api/auth/me", methods=["GET"])
+def auth_me():
+    """Return authenticated researcher profile with masked credentials."""
+    user_id = session.get("user_id")
+    if not user_id:
+        return jsonify({"logged_in": False, "user": None})
+
+    user = get_user_by_id(user_id)
+    if not user:
+        session.clear()
+        return jsonify({"logged_in": False, "user": None})
+
+    return jsonify({"logged_in": True, "user": user})
+
+
+@app.route("/api/auth/update-zotero", methods=["POST"])
+def auth_update_zotero():
+    """Update private Zotero credentials for the currently logged in researcher."""
+    user_id = session.get("user_id")
+    if not user_id:
+        return jsonify({"error": "Authentication required."}), 401
+
+    data = request.get_json(silent=True) or {}
+    key = data.get("zotero_api_key", "").strip() or None
+    uid = data.get("zotero_user_id", "").strip() or None
+
+    # Auto-resolve numeric User ID if key provided but no ID
+    if key and (not uid or not uid.isdigit()):
+        try:
+            res = requests.get(
+                f"https://api.zotero.org/keys/{key}",
+                headers={"Zotero-API-Version": "3"},
+                timeout=8
+            )
+            if res.status_code == 200:
+                uid = str(res.json().get("userID", ""))
+        except Exception:
+            pass
+
+    success = update_user_zotero(user_id, key, uid)
+    if not success:
+        return jsonify({"error": "User account not found."}), 404
+
+    updated_user = get_user_by_id(user_id)
+    return jsonify({
+        "message": "Zotero credentials updated successfully.",
+        "user": updated_user
+    })
+
+
+@app.route("/api/user/jobs", methods=["GET"])
+def user_jobs_list():
+    """Return past jobs submitted by the authenticated user."""
+    user_id = session.get("user_id")
+    if not user_id:
+        return jsonify({"jobs": []})
+
+    return jsonify({"jobs": get_user_jobs(user_id)})
+
+
+# ── Citation Workflow Execution Endpoints ────────────────────────────────────
 
 @app.route("/api/upload", methods=["POST"])
 def upload():
-    """Accept file uploads and trigger the pipeline."""
+    """Accept manuscript uploads, resolve user Zotero keys, and trigger processing."""
     cleanup_old_jobs()
 
     paper = request.files.get("paper")
@@ -207,10 +371,18 @@ def upload():
     custom_zotero_key = request.form.get("zotero_api_key", "").strip() or None
     custom_zotero_id = request.form.get("zotero_user_id", "").strip() or None
 
+    # If user is logged in and didn't provide a temporary key, load their saved account credentials
+    user_id = session.get("user_id")
+    if user_id and not custom_zotero_key:
+        user_record = get_user_by_id(user_id, include_secret=True)
+        if user_record and user_record.get("zotero_api_key"):
+            custom_zotero_key = user_record["zotero_api_key"]
+            custom_zotero_id = user_record.get("zotero_user_id")
+
     if not paper:
-        return jsonify({"error": "No paper file uploaded."}), 400
+        return jsonify({"error": "No research paper uploaded."}), 400
     if not paper.filename.lower().endswith(".docx"):
-        return jsonify({"error": "Paper must be a .docx file."}), 400
+        return jsonify({"error": "Research paper must be a .docx file."}), 400
     if paper.stream.seek(0, 2) > MAX_SIZE:
         return jsonify({"error": f"File too large (max {MAX_SIZE // 1024 // 1024}MB)."}), 400
     paper.stream.seek(0)
@@ -229,6 +401,9 @@ def upload():
         template_path = str(job_dir / "template.docx")
         template.save(template_path)
 
+    # Record job in database for logged in user
+    record_user_job(user_id, job_id, paper.filename, status="running")
+
     jobs[job_id] = {
         "id": job_id,
         "status": "running",
@@ -238,7 +413,7 @@ def upload():
         "error": None,
     }
 
-    # Run pipeline in a background thread
+    # Run pipeline in a background worker thread
     import threading
     t = threading.Thread(
         target=run_pipeline_locally,
@@ -253,7 +428,7 @@ def upload():
 
 @app.route("/api/status/<job_id>")
 def status(job_id: str):
-    """Poll processing status."""
+    """Poll real-time processing status and pipeline statistics."""
     if job_id not in jobs:
         return jsonify({"error": "Job not found."}), 404
     return jsonify(jobs[job_id])
@@ -261,7 +436,7 @@ def status(job_id: str):
 
 @app.route("/api/download/<job_id>/<filename>")
 def download(job_id: str, filename: str):
-    """Download a processed output file."""
+    """Download an individual processed output deliverable."""
     safe_name = Path(filename).name  # prevent path traversal
     file_path = OUTPUT_DIR / job_id / safe_name
     if not file_path.exists():
@@ -269,21 +444,45 @@ def download(job_id: str, filename: str):
     return send_file(str(file_path), as_attachment=True, download_name=safe_name)
 
 
+@app.route("/api/download-all/<job_id>")
+def download_all_zip(job_id: str):
+    """Package all output deliverables for a job into a convenient ZIP bundle."""
+    target_dir = OUTPUT_DIR / job_id
+    if not target_dir.exists():
+        return jsonify({"error": "Job outputs not found."}), 404
+
+    zip_filename = f"IEEE_Submission_Bundle_{job_id}.zip"
+    zip_path = target_dir / zip_filename
+
+    # Build ZIP archive of all valid deliverables
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for f in target_dir.iterdir():
+            if f.is_file() and f.name != zip_filename and not f.name.endswith('.tmp'):
+                zipf.write(f, arcname=f.name)
+
+    return send_file(str(zip_path), as_attachment=True, download_name=zip_filename)
+
+
 @app.route("/api/health")
 def health():
-    return jsonify({"status": "ok", "n8n_webhook": N8N_WEBHOOK})
+    """Health check for deployment platforms."""
+    return jsonify({
+        "status": "ok",
+        "version": "2.2.0",
+        "n8n_webhook": N8N_WEBHOOK,
+        "database": "sqlite_ready"
+    })
 
 
 @app.route("/api/validate-zotero", methods=["POST"])
 def validate_zotero():
-    """Verify a user's private Zotero key and return their user ID & library name."""
+    """Verify a user's private Zotero key and return their user ID & library username."""
     body = request.get_json(silent=True) or {}
     key = body.get("api_key", "").strip()
     if not key:
         return jsonify({"valid": False, "error": "Please enter an API key to test."})
 
     try:
-        import requests
         res = requests.get(
             f"https://api.zotero.org/keys/{key}",
             headers={"Zotero-API-Version": "3"},
@@ -313,849 +512,6 @@ def validate_zotero():
         return jsonify({"valid": False, "error": f"Connection error: {str(e)}"})
 
 
-
-# ── HTML Page (self-contained) ────────────────────────────────────────────────
-
-HTML_PAGE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>IEEE Citation Workflow — Automated Formatter</title>
-<meta name="description" content="Automate IEEE journal citation formatting without changing your original research paper text.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --bg: #0a0f1e;
-    --surface: #111827;
-    --surface2: #1a2235;
-    --border: rgba(99,179,237,0.15);
-    --accent: #3b82f6;
-    --accent2: #8b5cf6;
-    --accent3: #06b6d4;
-    --success: #10b981;
-    --warning: #f59e0b;
-    --error: #ef4444;
-    --text: #e2e8f0;
-    --text2: #94a3b8;
-    --text3: #64748b;
-    --glow: 0 0 40px rgba(59,130,246,0.15);
-  }
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  html { scroll-behavior: smooth; }
-  body {
-    font-family: 'Inter', sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    min-height: 100vh;
-    overflow-x: hidden;
-  }
-
-  /* ── Background animation ── */
-  body::before {
-    content: '';
-    position: fixed; inset: 0; z-index: -1;
-    background:
-      radial-gradient(ellipse 80% 50% at 20% 10%, rgba(59,130,246,0.08) 0%, transparent 60%),
-      radial-gradient(ellipse 60% 40% at 80% 80%, rgba(139,92,246,0.07) 0%, transparent 60%),
-      radial-gradient(ellipse 40% 30% at 50% 50%, rgba(6,182,212,0.04) 0%, transparent 70%);
-  }
-
-  /* ── Header ── */
-  header {
-    padding: 2rem 2rem 1rem;
-    text-align: center;
-    position: relative;
-  }
-  .logo-badge {
-    display: inline-flex; align-items: center; gap: 0.5rem;
-    background: linear-gradient(135deg, rgba(59,130,246,0.2), rgba(139,92,246,0.2));
-    border: 1px solid var(--border);
-    border-radius: 2rem;
-    padding: 0.4rem 1.2rem;
-    font-size: 0.75rem;
-    font-weight: 500;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--accent3);
-    margin-bottom: 1.5rem;
-  }
-  .logo-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent3); animation: pulse 2s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1;transform:scale(1);} 50%{opacity:0.5;transform:scale(0.8);} }
-
-  h1 {
-    font-size: clamp(2rem, 5vw, 3.2rem);
-    font-weight: 700;
-    line-height: 1.15;
-    background: linear-gradient(135deg, #e2e8f0 30%, #93c5fd 60%, #c4b5fd 100%);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    background-clip: text;
-    margin-bottom: 1rem;
-  }
-  .subtitle {
-    color: var(--text2);
-    font-size: 1.05rem;
-    max-width: 600px;
-    margin: 0 auto 0.75rem;
-    line-height: 1.6;
-  }
-  .critical-badge {
-    display: inline-flex; align-items: center; gap: 0.4rem;
-    background: rgba(16,185,129,0.12);
-    border: 1px solid rgba(16,185,129,0.3);
-    border-radius: 0.5rem;
-    padding: 0.5rem 1rem;
-    font-size: 0.82rem;
-    color: var(--success);
-    font-weight: 500;
-    margin-top: 0.5rem;
-  }
-  .shield-icon { font-size: 1rem; }
-
-  /* ── Main container ── */
-  .container {
-    max-width: 900px;
-    margin: 0 auto;
-    padding: 1rem 2rem 4rem;
-  }
-
-  /* ── Cards ── */
-  .card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 1.25rem;
-    padding: 2rem;
-    margin-bottom: 1.5rem;
-    position: relative;
-    overflow: hidden;
-    transition: border-color 0.3s, box-shadow 0.3s;
-  }
-  .card::before {
-    content: '';
-    position: absolute; top: 0; left: 0; right: 0; height: 2px;
-    background: linear-gradient(90deg, var(--accent), var(--accent2), var(--accent3));
-    opacity: 0;
-    transition: opacity 0.3s;
-  }
-  .card:hover { border-color: rgba(99,179,237,0.3); box-shadow: var(--glow); }
-  .card:hover::before { opacity: 1; }
-
-  .card-title {
-    font-size: 1rem;
-    font-weight: 600;
-    color: var(--text);
-    margin-bottom: 0.4rem;
-    display: flex; align-items: center; gap: 0.6rem;
-  }
-  .card-icon {
-    width: 2rem; height: 2rem;
-    background: linear-gradient(135deg, rgba(59,130,246,0.2), rgba(139,92,246,0.2));
-    border-radius: 0.5rem;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 1rem;
-    flex-shrink: 0;
-  }
-  .card-desc { color: var(--text3); font-size: 0.85rem; margin-bottom: 1.25rem; }
-
-  /* ── Upload zones ── */
-  .upload-zone {
-    border: 2px dashed var(--border);
-    border-radius: 0.875rem;
-    padding: 1.75rem 1.5rem;
-    text-align: center;
-    cursor: pointer;
-    transition: all 0.25s;
-    position: relative;
-    background: rgba(255,255,255,0.02);
-  }
-  .upload-zone:hover, .upload-zone.drag-over {
-    border-color: var(--accent);
-    background: rgba(59,130,246,0.06);
-    transform: translateY(-1px);
-  }
-  .upload-zone input[type=file] {
-    position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
-  }
-  .upload-icon { font-size: 2.2rem; margin-bottom: 0.6rem; display: block; }
-  .upload-label { font-weight: 500; font-size: 0.95rem; color: var(--text); margin-bottom: 0.3rem; }
-  .upload-hint { font-size: 0.78rem; color: var(--text3); }
-  .upload-filename {
-    display: none;
-    margin-top: 0.75rem;
-    padding: 0.5rem 0.875rem;
-    background: rgba(16,185,129,0.12);
-    border: 1px solid rgba(16,185,129,0.25);
-    border-radius: 0.5rem;
-    font-size: 0.8rem;
-    color: var(--success);
-    font-family: 'JetBrains Mono', monospace;
-    word-break: break-all;
-  }
-  .upload-filename.visible { display: block; }
-
-  /* ── Zotero connection ── */
-  .zotero-info {
-    background: rgba(59,130,246,0.06);
-    border: 1px solid rgba(59,130,246,0.2);
-    border-radius: 0.75rem;
-    padding: 1rem 1.25rem;
-    font-size: 0.85rem;
-    color: var(--text2);
-    line-height: 1.6;
-  }
-  .zotero-status {
-    display: flex; align-items: center; gap: 0.5rem;
-    font-weight: 500;
-    color: var(--warning);
-    margin-bottom: 0.5rem;
-  }
-  .zotero-status.connected { color: var(--success); }
-  .status-dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--warning);
-    animation: pulse 2s infinite;
-  }
-  .status-dot.connected { background: var(--success); animation: none; }
-
-  /* ── Run button ── */
-  .btn-run {
-    width: 100%;
-    padding: 1.1rem 2rem;
-    background: linear-gradient(135deg, #2563eb, #7c3aed);
-    border: none;
-    border-radius: 0.875rem;
-    color: white;
-    font-size: 1.05rem;
-    font-weight: 600;
-    font-family: 'Inter', sans-serif;
-    cursor: pointer;
-    transition: all 0.25s;
-    position: relative;
-    overflow: hidden;
-    letter-spacing: 0.02em;
-  }
-  .btn-run::after {
-    content: '';
-    position: absolute; inset: 0;
-    background: linear-gradient(135deg, rgba(255,255,255,0.1), transparent);
-    opacity: 0;
-    transition: opacity 0.25s;
-  }
-  .btn-run:hover:not(:disabled) {
-    transform: translateY(-2px);
-    box-shadow: 0 8px 30px rgba(59,130,246,0.4);
-  }
-  .btn-run:hover:not(:disabled)::after { opacity: 1; }
-  .btn-run:active:not(:disabled) { transform: translateY(0); }
-  .btn-run:disabled {
-    opacity: 0.55;
-    cursor: not-allowed;
-    transform: none;
-  }
-  .btn-run .spinner {
-    display: none;
-    width: 18px; height: 18px;
-    border: 2px solid rgba(255,255,255,0.3);
-    border-top-color: white;
-    border-radius: 50%;
-    animation: spin 0.7s linear infinite;
-    margin-right: 0.5rem;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  .btn-run.loading .spinner { display: inline-block; }
-
-  /* ── Progress section ── */
-  #progress-section { display: none; }
-  .progress-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 1.25rem;
-    padding: 2rem;
-    margin-bottom: 1.5rem;
-  }
-  .progress-header {
-    display: flex; align-items: center; justify-content: space-between;
-    margin-bottom: 1.25rem;
-  }
-  .progress-title { font-weight: 600; font-size: 1rem; }
-  .progress-pct {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.9rem;
-    color: var(--accent);
-    font-weight: 500;
-  }
-  .progress-bar-track {
-    height: 6px;
-    background: rgba(255,255,255,0.07);
-    border-radius: 3px;
-    overflow: hidden;
-    margin-bottom: 1rem;
-  }
-  .progress-bar-fill {
-    height: 100%;
-    background: linear-gradient(90deg, var(--accent), var(--accent2));
-    border-radius: 3px;
-    transition: width 0.5s ease;
-    position: relative;
-  }
-  .progress-bar-fill::after {
-    content: '';
-    position: absolute; right: 0; top: 0; bottom: 0; width: 20px;
-    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3));
-    animation: shimmer 1.5s infinite;
-  }
-  @keyframes shimmer { 0%{opacity:0;} 50%{opacity:1;} 100%{opacity:0;} }
-  .stage-label {
-    font-size: 0.85rem; color: var(--text2);
-    font-family: 'JetBrains Mono', monospace;
-    display: flex; align-items: center; gap: 0.5rem;
-  }
-  .stage-dot {
-    width: 6px; height: 6px; border-radius: 50%;
-    background: var(--accent);
-    animation: pulse 1.5s infinite;
-    flex-shrink: 0;
-  }
-
-  /* ── Download section ── */
-  #download-section { display: none; }
-  .download-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-    gap: 1rem;
-  }
-  .download-item {
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 0.875rem;
-    padding: 1.25rem;
-    display: flex; flex-direction: column; gap: 0.75rem;
-    transition: all 0.25s;
-    cursor: pointer;
-    text-decoration: none;
-    color: inherit;
-  }
-  .download-item:hover {
-    border-color: rgba(59,130,246,0.4);
-    transform: translateY(-2px);
-    box-shadow: 0 4px 20px rgba(59,130,246,0.15);
-  }
-  .dl-icon { font-size: 1.75rem; }
-  .dl-name { font-weight: 600; font-size: 0.88rem; font-family: 'JetBrains Mono', monospace; word-break: break-all; }
-  .dl-desc { font-size: 0.78rem; color: var(--text3); line-height: 1.5; }
-  .dl-btn {
-    display: inline-flex; align-items: center; gap: 0.35rem;
-    background: linear-gradient(135deg, rgba(59,130,246,0.2), rgba(139,92,246,0.2));
-    border: 1px solid rgba(59,130,246,0.3);
-    border-radius: 0.5rem;
-    padding: 0.45rem 0.875rem;
-    font-size: 0.78rem;
-    font-weight: 500;
-    color: var(--accent);
-    transition: all 0.2s;
-  }
-  .download-item:hover .dl-btn { background: rgba(59,130,246,0.3); }
-
-  /* ── Error section ── */
-  .error-box {
-    display: none;
-    background: rgba(239,68,68,0.08);
-    border: 1px solid rgba(239,68,68,0.3);
-    border-radius: 0.875rem;
-    padding: 1.25rem;
-    color: var(--error);
-    font-size: 0.88rem;
-    line-height: 1.6;
-    margin-top: 1rem;
-  }
-  .error-box.visible { display: block; }
-  .error-title { font-weight: 600; margin-bottom: 0.5rem; font-size: 0.95rem; }
-
-  /* ── Steps guide ── */
-  .steps { display: flex; flex-direction: column; gap: 0.75rem; }
-  .step {
-    display: flex; align-items: flex-start; gap: 1rem;
-    padding: 0.875rem 1rem;
-    background: rgba(255,255,255,0.02);
-    border-radius: 0.75rem;
-    border: 1px solid transparent;
-    transition: border-color 0.2s;
-  }
-  .step:hover { border-color: var(--border); }
-  .step-num {
-    width: 28px; height: 28px; border-radius: 50%;
-    background: linear-gradient(135deg, var(--accent), var(--accent2));
-    display: flex; align-items: center; justify-content: center;
-    font-size: 0.75rem; font-weight: 700; flex-shrink: 0;
-    color: white;
-  }
-  .step-content { flex: 1; }
-  .step-title { font-weight: 500; font-size: 0.9rem; margin-bottom: 0.2rem; }
-  .step-desc { font-size: 0.8rem; color: var(--text3); line-height: 1.5; }
-
-  /* ── Responsive ── */
-  @media (max-width: 600px) {
-    .container { padding: 1rem; }
-    .card { padding: 1.25rem; }
-    .download-grid { grid-template-columns: 1fr; }
-    h1 { font-size: 1.8rem; }
-  }
-</style>
-</head>
-<body>
-
-<header>
-  <div class="logo-badge">
-    <div class="logo-dot"></div>
-    IEEE Citation Automation System
-  </div>
-  <h1>Research Paper<br>Citation Workflow</h1>
-  <p class="subtitle">
-    Upload your Word paper and IEEE template. The system verifies references,
-    formats citations, and delivers a submission-ready document.
-  </p>
-  <div class="critical-badge">
-    <span class="shield-icon">🛡️</span>
-    Your original text is NEVER modified &mdash; only citation numbers are updated
-  </div>
-</header>
-
-<div class="container">
-
-  <!-- Upload Form -->
-  <div class="card" id="upload-card">
-    <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:1.5rem;">
-      <div class="card-icon">📄</div>
-      <div>
-        <div class="card-title">Upload Your Documents</div>
-        <div class="card-desc">Both files are accepted as .docx only</div>
-      </div>
-    </div>
-
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1.5rem;">
-      <!-- Paper upload -->
-      <div>
-        <label style="font-size:0.82rem;font-weight:500;color:var(--text2);display:block;margin-bottom:0.5rem;">
-          Research Paper <span style="color:var(--error)">*</span>
-        </label>
-        <div class="upload-zone" id="paper-zone">
-          <input type="file" id="paper-input" accept=".docx">
-          <span class="upload-icon">📝</span>
-          <div class="upload-label">Click or drag & drop</div>
-          <div class="upload-hint">Your research paper .docx</div>
-          <div class="upload-filename" id="paper-name"></div>
-        </div>
-      </div>
-      <!-- Template upload -->
-      <div>
-        <label style="font-size:0.82rem;font-weight:500;color:var(--text2);display:block;margin-bottom:0.5rem;">
-          IEEE Journal Template <span style="color:var(--text3)">(optional)</span>
-        </label>
-        <div class="upload-zone" id="template-zone">
-          <input type="file" id="template-input" accept=".docx">
-          <span class="upload-icon">📋</span>
-          <div class="upload-label">Click or drag & drop</div>
-          <div class="upload-hint">IEEE template .docx</div>
-          <div class="upload-filename" id="template-name"></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Zotero connection section -->
-    <div style="margin-bottom:1.5rem;background:rgba(255,255,255,0.02);border:1px solid var(--border);border-radius:0.75rem;padding:1.25rem;">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.75rem;flex-wrap:wrap;gap:0.5rem;">
-        <label style="font-size:0.88rem;font-weight:600;color:var(--text);display:flex;align-items:center;gap:0.5rem;">
-          <span>📚</span> Connect Your Own Zotero Library <span style="font-size:0.75rem;color:var(--text3);font-weight:400;">(Optional)</span>
-        </label>
-        <a href="https://www.zotero.org/settings/keys" target="_blank" rel="noopener" style="font-size:0.78rem;color:var(--accent);text-decoration:none;">
-          Get Free Read-Only Key ↗
-        </a>
-      </div>
-      <p style="font-size:0.8rem;color:var(--text2);margin-bottom:1rem;line-height:1.5;">
-        <strong>Multi-User Privacy:</strong> No personal credentials are saved on this server. Each user connects their own Zotero account. Your API key is used strictly in-memory during processing and wiped immediately after. If you leave this blank, references will be verified automatically using <strong>Crossref &amp; Semantic Scholar</strong>.
-      </p>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;">
-        <div>
-          <label style="font-size:0.75rem;color:var(--text3);display:block;margin-bottom:0.35rem;font-weight:500;">Your Zotero API Key</label>
-          <input type="password" id="custom-zotero-key" placeholder="Paste your private Zotero API key..." style="width:100%;padding:0.6rem;background:var(--surface2);border:1px solid var(--border);border-radius:0.5rem;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:0.8rem;">
-        </div>
-        <div>
-          <label style="font-size:0.75rem;color:var(--text3);display:block;margin-bottom:0.35rem;font-weight:500;">Numeric User ID</label>
-          <input type="text" id="custom-zotero-id" placeholder="Optional: auto-detected if left blank" style="width:100%;padding:0.6rem;background:var(--surface2);border:1px solid var(--border);border-radius:0.5rem;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:0.8rem;">
-        </div>
-      </div>
-      <div style="margin-top:0.75rem;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;">
-        <div style="display:flex;align-items:center;gap:0.5rem;">
-          <button type="button" onclick="testZoteroKey()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);font-size:0.75rem;padding:0.35rem 0.75rem;border-radius:0.35rem;cursor:pointer;font-weight:500;display:flex;align-items:center;gap:0.35rem;">
-            <span>🔍</span> Test Connection
-          </button>
-          <span id="zotero-test-status" style="font-size:0.75rem;display:none;"></span>
-        </div>
-        <label style="font-size:0.75rem;color:var(--text3);display:flex;align-items:center;gap:0.35rem;cursor:pointer;user-select:none;">
-          <input type="checkbox" id="remember-zotero-key" onchange="toggleRememberKey()" style="accent-color:var(--accent);">
-          <span>Remember key in my browser only (local storage)</span>
-        </label>
-      </div>
-      <div style="font-size:0.73rem;color:var(--text3);margin-top:0.65rem;display:flex;align-items:center;gap:0.4rem;">
-        <span>🔒</span> Zero server retention. Each user's private key remains strictly isolated.
-      </div>
-    </div>
-
-
-    <!-- Run button -->
-    <button class="btn-run" id="run-btn" onclick="startWorkflow()">
-      <span class="spinner" id="btn-spinner"></span>
-      <span id="btn-text">🚀 Run Workflow</span>
-    </button>
-
-    <div class="error-box" id="error-box">
-      <div class="error-title">⚠️ Error</div>
-      <div id="error-message"></div>
-    </div>
-  </div>
-
-  <!-- Progress -->
-  <div id="progress-section">
-    <div class="progress-card">
-      <div class="progress-header">
-        <div class="progress-title">⚙️ Processing your paper...</div>
-        <div class="progress-pct" id="progress-pct">0%</div>
-      </div>
-      <div class="progress-bar-track">
-        <div class="progress-bar-fill" id="progress-bar" style="width:0%"></div>
-      </div>
-      <div class="stage-label">
-        <div class="stage-dot" id="stage-dot"></div>
-        <span id="stage-text">Initializing...</span>
-      </div>
-    </div>
-  </div>
-
-  <!-- Downloads -->
-  <div id="download-section">
-    <div class="card">
-      <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:1.5rem;">
-        <div class="card-icon">✅</div>
-        <div>
-          <div class="card-title">Processing Complete</div>
-          <div class="card-desc">Download your IEEE formatted paper, reports &amp; citation files</div>
-        </div>
-      </div>
-      <div id="stats-banner"></div>
-      <div class="download-grid" id="download-grid"></div>
-    </div>
-  </div>
-
-  <!-- How It Works -->
-  <div class="card">
-    <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:1.25rem;">
-      <div class="card-icon">🔬</div>
-      <div>
-        <div class="card-title">How It Works</div>
-        <div class="card-desc">7-stage automated pipeline</div>
-      </div>
-    </div>
-    <div class="steps">
-      <div class="step">
-        <div class="step-num">A</div>
-        <div class="step-content">
-          <div class="step-title">Read &amp; Inspect</div>
-          <div class="step-desc">Extract paragraphs, [N] citation markers, reference entries, tables, and figures. Back up the original untouched.</div>
-        </div>
-      </div>
-      <div class="step">
-        <div class="step-num">B</div>
-        <div class="step-content">
-          <div class="step-title">Verify References Online</div>
-          <div class="step-desc">Check each reference against your Zotero library, Crossref, and Semantic Scholar. Unverifiable references are flagged — never silently accepted.</div>
-        </div>
-      </div>
-      <div class="step">
-        <div class="step-num">C</div>
-        <div class="step-content">
-          <div class="step-title">Map Citations to Text</div>
-          <div class="step-desc">Match each [N] marker to its verified reference. Detect ordering issues. Flag uncertain mappings for your review.</div>
-        </div>
-      </div>
-      <div class="step">
-        <div class="step-num">D</div>
-        <div class="step-content">
-          <div class="step-title">Apply IEEE Citation Style</div>
-          <div class="step-desc">Renumber citations by first appearance per IEEE rules. Only citation numbers change — never sentence wording.</div>
-        </div>
-      </div>
-      <div class="step">
-        <div class="step-num">E</div>
-        <div class="step-content">
-          <div class="step-title">Format the Bibliography</div>
-          <div class="step-desc">Build the complete IEEE-formatted reference list using verified metadata from Crossref and Zotero.</div>
-        </div>
-      </div>
-      <div class="step">
-        <div class="step-num">F</div>
-        <div class="step-content">
-          <div class="step-title">Apply Journal Template</div>
-          <div class="step-desc">Copy margins, page size, column layout, and styles from your IEEE template. Text is preserved exactly.</div>
-        </div>
-      </div>
-      <div class="step">
-        <div class="step-num">G</div>
-        <div class="step-content">
-          <div class="step-title">Validate &amp; Report</div>
-          <div class="step-desc">Compare original vs final paragraph by paragraph. Any unexpected change triggers a failure report.</div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-</div>
-
-<script>
-let currentJobId = null;
-let pollInterval = null;
-
-const FILE_DESCRIPTIONS = {
-  'IEEE_Formatted_Research_Paper.docx': {icon:'📄', desc:'Your paper with IEEE citations, interactive Ctrl+Click hyperlinks, hover tooltips & bibliography.'},
-  'Original_Research_Paper_Backup.docx': {icon:'🔒', desc:'Untouched backup of your original document. 100% text preservation verified.'},
-  'Citation_Verification_Report.csv': {icon:'📊', desc:'Detailed verification spreadsheet: status, DOI, and verified metadata for all references.'},
-  'Text_Preservation_Report.txt': {icon:'🛡️', desc:'Paragraph-by-paragraph proof that zero manuscript words were altered.'},
-  'Unresolved_Citations_Report.txt': {icon:'⚠️', desc:'Verification check: flags any unverified references needing review before submitting.'},
-  'references.bib': {icon:'📚', desc:'BibTeX export file — ready if your journal requests a .bib file.'},
-  'references.ris': {icon:'📑', desc:'EndNote & Zotero RIS export file — ready for any citation manager.'},
-};
-
-// ── Privacy & Zotero Key Management ──
-function initZoteroPreferences() {
-  try {
-    const savedKey = localStorage.getItem('user_zotero_key');
-    const savedId = localStorage.getItem('user_zotero_id');
-    const rememberCheckbox = document.getElementById('remember-zotero-key');
-    const keyInput = document.getElementById('custom-zotero-key');
-    const idInput = document.getElementById('custom-zotero-id');
-
-    if (savedKey) {
-      if (keyInput) keyInput.value = savedKey;
-      if (idInput && savedId) idInput.value = savedId;
-      if (rememberCheckbox) rememberCheckbox.checked = true;
-    }
-  } catch (e) {}
-}
-
-function toggleRememberKey() {
-  const rememberCheckbox = document.getElementById('remember-zotero-key');
-  const keyInput = document.getElementById('custom-zotero-key');
-  const idInput = document.getElementById('custom-zotero-id');
-  if (rememberCheckbox && !rememberCheckbox.checked) {
-    try {
-      localStorage.removeItem('user_zotero_key');
-      localStorage.removeItem('user_zotero_id');
-    } catch (e) {}
-  } else if (rememberCheckbox && rememberCheckbox.checked) {
-    try {
-      if (keyInput?.value?.trim()) localStorage.setItem('user_zotero_key', keyInput.value.trim());
-      if (idInput?.value?.trim()) localStorage.setItem('user_zotero_id', idInput.value.trim());
-    } catch (e) {}
-  }
-}
-
-async function testZoteroKey() {
-  const keyInput = document.getElementById('custom-zotero-key');
-  const idInput = document.getElementById('custom-zotero-id');
-  const statusEl = document.getElementById('zotero-test-status');
-  const key = keyInput?.value?.trim();
-
-  if (!key) {
-    statusEl.style.display = 'inline-block';
-    statusEl.style.color = 'var(--warning)';
-    statusEl.innerHTML = '⚠️ Enter a key first (or leave blank to use Crossref).';
-    return;
-  }
-
-  statusEl.style.display = 'inline-block';
-  statusEl.style.color = 'var(--text3)';
-  statusEl.innerHTML = '⏳ Testing connection...';
-
-  try {
-    const res = await fetch('/api/validate-zotero', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ api_key: key })
-    });
-    const data = await res.json();
-    if (data.valid) {
-      statusEl.style.color = 'var(--success)';
-      statusEl.innerHTML = `✓ Connected! (User ID: ${data.user_id})`;
-      if (idInput && !idInput.value.trim()) {
-        idInput.value = data.user_id;
-      }
-      toggleRememberKey();
-    } else {
-      statusEl.style.color = 'var(--error)';
-      statusEl.innerHTML = `✕ ${data.error || 'Connection failed'}`;
-    }
-  } catch (err) {
-    statusEl.style.color = 'var(--error)';
-    statusEl.innerHTML = `✕ Test failed: ${err.message}`;
-  }
-}
-
-window.addEventListener('DOMContentLoaded', initZoteroPreferences);
-
-
-// ── Drag & drop setup ──
-['paper', 'template'].forEach(type => {
-  const zone = document.getElementById(type + '-zone');
-  const input = document.getElementById(type + '-input');
-  const nameEl = document.getElementById(type + '-name');
-
-  zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('drag-over'); });
-  zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
-  zone.addEventListener('drop', e => {
-    e.preventDefault();
-    zone.classList.remove('drag-over');
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      input.files = e.dataTransfer.files;
-      showFileName(nameEl, e.dataTransfer.files[0].name);
-    }
-  });
-  input.addEventListener('change', () => {
-    if (input.files && input.files[0]) showFileName(nameEl, input.files[0].name);
-  });
-});
-
-function showFileName(el, name) {
-  el.textContent = '✓ ' + name;
-  el.classList.add('visible');
-}
-
-async function startWorkflow() {
-  const paper = document.getElementById('paper-input').files[0];
-  const template = document.getElementById('template-input').files[0];
-
-  if (!paper) {
-    showError('Please upload your research paper (.docx) before running.');
-    return;
-  }
-
-  hideError();
-  setRunning(true);
-
-  const formData = new FormData();
-  formData.append('paper', paper);
-  if (template) formData.append('template', template);
-
-  const customKey = document.getElementById('custom-zotero-key')?.value?.trim();
-  const customId = document.getElementById('custom-zotero-id')?.value?.trim();
-  if (customKey) formData.append('zotero_api_key', customKey);
-  if (customId) formData.append('zotero_user_id', customId);
-  toggleRememberKey();
-
-
-  try {
-    const res = await fetch('/api/upload', { method: 'POST', body: formData });
-    const data = await res.json();
-    if (!res.ok) { showError(data.error || 'Upload failed.'); setRunning(false); return; }
-
-    currentJobId = data.job_id;
-    document.getElementById('progress-section').style.display = 'block';
-    document.getElementById('download-section').style.display = 'none';
-    pollInterval = setInterval(pollStatus, 1500);
-  } catch (e) {
-    showError('Network error: ' + e.message);
-    setRunning(false);
-  }
-}
-
-async function pollStatus() {
-  if (!currentJobId) return;
-  try {
-    const res = await fetch('/api/status/' + currentJobId);
-    const data = await res.json();
-
-    document.getElementById('progress-pct').textContent = data.progress + '%';
-    document.getElementById('progress-bar').style.width = data.progress + '%';
-    document.getElementById('stage-text').textContent = data.stage || '';
-
-    if (data.status === 'done') {
-      clearInterval(pollInterval);
-      setRunning(false);
-      document.getElementById('stage-dot').style.animation = 'none';
-      document.getElementById('stage-dot').style.background = 'var(--success)';
-      showDownloads(data.output_files, currentJobId, data.stats);
-    } else if (data.status === 'error') {
-      clearInterval(pollInterval);
-      setRunning(false);
-      document.getElementById('progress-section').style.display = 'none';
-      showError(data.error || 'An unknown error occurred. Check the logs folder.');
-    }
-  } catch (e) {
-    // Network blip — keep polling
-  }
-}
-
-function showDownloads(files, jobId, stats) {
-  const banner = document.getElementById('stats-banner');
-  if (banner && stats) {
-    banner.innerHTML = `
-      <div style="display:flex;flex-wrap:wrap;gap:0.75rem;margin-bottom:1.5rem;padding:1rem;background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.25);border-radius:0.75rem;">
-        <div style="background:rgba(17,24,39,0.85);border:1px solid var(--border);border-radius:0.5rem;padding:0.4rem 0.8rem;font-size:0.82rem;">
-          📄 <strong>${stats.in_text_markers || stats.citations_remapped || 'All'}</strong> Citations Remapped
-        </div>
-        <div style="background:rgba(17,24,39,0.85);border:1px solid rgba(16,185,129,0.4);border-radius:0.5rem;padding:0.4rem 0.8rem;font-size:0.82rem;color:var(--success);">
-          🔗 <strong>Ctrl+Click</strong> Interactive Hyperlinks
-        </div>
-        <div style="background:rgba(17,24,39,0.85);border:1px solid rgba(6,182,212,0.4);border-radius:0.5rem;padding:0.4rem 0.8rem;font-size:0.82rem;color:var(--accent3);">
-          🏷️ <strong>ScreenTip</strong> Hover Tooltips
-        </div>
-        <div style="background:rgba(17,24,39,0.85);border:1px solid var(--border);border-radius:0.5rem;padding:0.4rem 0.8rem;font-size:0.82rem;">
-          📚 <strong>${stats.references_total || '30'}</strong> References Matched
-        </div>
-        <div style="background:rgba(17,24,39,0.85);border:1px solid rgba(16,185,129,0.4);border-radius:0.5rem;padding:0.4rem 0.8rem;font-size:0.82rem;color:var(--success);">
-          🛡️ <strong>100%</strong> Original Text Preserved
-        </div>
-      </div>
-    `;
-  }
-  const grid = document.getElementById('download-grid');
-  grid.innerHTML = '';
-  files.forEach(fname => {
-    const info = FILE_DESCRIPTIONS[fname] || {icon:'📁', desc:'Output file'};
-    const a = document.createElement('a');
-    a.href = '/api/download/' + jobId + '/' + encodeURIComponent(fname);
-    a.download = fname;
-    a.className = 'download-item';
-    a.innerHTML = `
-      <div class="dl-icon">${info.icon}</div>
-      <div class="dl-name">${fname}</div>
-      <div class="dl-desc">${info.desc}</div>
-      <div class="dl-btn">⬇ Download</div>
-    `;
-    grid.appendChild(a);
-  });
-  document.getElementById('download-section').style.display = 'block';
-}
-
-function setRunning(running) {
-  const btn = document.getElementById('run-btn');
-  const text = document.getElementById('btn-text');
-  btn.disabled = running;
-  btn.classList.toggle('loading', running);
-  text.textContent = running ? 'Processing...' : '🚀 Run Workflow';
-}
-
-function showError(msg) {
-  document.getElementById('error-message').textContent = msg;
-  document.getElementById('error-box').classList.add('visible');
-}
-function hideError() {
-  document.getElementById('error-box').classList.remove('visible');
-}
-</script>
-</body>
-</html>"""
-
-
 if __name__ == "__main__":
-    logger.info(f"Starting server on http://localhost:{PORT}")
+    logger.info(f"Starting IEEE Citation Automation Server on http://localhost:{PORT}")
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)

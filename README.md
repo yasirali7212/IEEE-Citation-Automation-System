@@ -53,9 +53,9 @@ This system fully automates that process in minutes while enforcing two non-nego
   - Personal **Zotero** libraries (via the Zotero Web API v3).
   - Public scholarly registries via the **Crossref REST API** (auto-discovering verified DOIs, volumes, issues, and page numbers).
   - Scholarly literature via the **Semantic Scholar API**.
-- **📦 Multi-Format Reference Export:** Automatically generates `.bib` (BibTeX for LaTeX) and `.ris` (EndNote / Zotero / Mendeley exchange) files alongside your `.docx` paper.
-- **🔒 Multi-User Privacy & Security:** Zero server storage for personal credentials. Each user can bring their own Zotero API key (or leave it blank to rely entirely on Crossref). Keys are processed purely in-memory and wiped immediately after conversion.
-- **⚡ Modern Responsive Web Interface:** Includes real-time progress indicators, drag-and-drop file uploads, live status metrics, and a key validation tester.
+- **📦 Multi-Format Reference Export:** Automatically generates `.bib` (BibTeX for LaTeX) and `.ris` (EndNote / Zotero / Mendeley exchange) files alongside your `.docx` paper, with a one-click ZIP download bundle.
+- **👤 User Authentication & Private Credentials:** Built-in Sign Up and Login system with secure password hashing. Each researcher saves their private Zotero API credentials isolated in their account so no keys are ever shared or exposed.
+- **✨ Modern Glassmorphic Academic UI:** High-contrast dark mode interface with drag-and-drop dropzones, real-time 8-stage progress tracker, interactive metric counters, user job history, and live Zotero key verification.
 - **🧹 Automatic Storage Maintenance:** Automatically cleans up uploads and processed files older than 24 hours to preserve server disk space and privacy.
 
 ---
@@ -126,12 +126,13 @@ When submitting your paper to an IEEE journal or conference (via IEEE Author Por
 
 ## 🔐 Multi-User Security & Privacy Model
 
-This system is engineered for multi-user shared deployment (e.g. hosted on Render, Railway, or an internal research lab server) with **strict zero-trust privacy**:
+This system is engineered for multi-user shared deployment (e.g. hosted on Render, Railway, or an internal research lab server) with **strict account-level isolation**:
 
-- **No Central Keys:** The server holds **no global Zotero API keys** or personal passwords.
-- **In-Memory Credential Scope:** When a user inputs their personal Zotero API key in the web interface, it is passed strictly to the child subprocess of that specific conversion task. It is never written to disk, `.env`, or server logs, and is discarded from memory when the task finishes.
-- **Browser-Only Storage:** Users can check *"Remember key in my browser only"*. This stores the key strictly inside the visitor's local browser (`localStorage`) on their personal computer. Other users or server administrators cannot view it.
-- **Zero-Setup Mode:** If a user does not have a Zotero account, they simply leave the Zotero field blank. The system automatically performs reference matching using public Crossref and Semantic Scholar APIs.
+- **Per-User Private Credentials:** Every researcher creates an individual account (protected by PBKDF2/scrypt password hashing). Your personal Zotero API key and User ID are tied strictly to your own account.
+- **Zero Cross-User Leakage:** When a paper is submitted for formatting, only the authenticated user's credentials are injected into the subprocess. User A cannot view, access, or utilize User B's Zotero library or documents.
+- **In-Memory Pipeline Execution:** During conversion, the API key is passed directly via child process environment variables and discarded immediately when processing completes.
+- **Temporary Guest Mode Support:** Guests who prefer not to create an account can input a one-time key directly in the upload drawer, or leave it blank to verify references via public Crossref and Semantic Scholar APIs.
+- **Automatic 24-Hour Cleanup:** Uploaded manuscripts, output files, and execution logs older than 24 hours are deleted by automatic background rotation to maintain privacy and disk hygiene.
 
 ---
 
@@ -163,9 +164,13 @@ d:\bot\
 │   ├── crossref_client.py             # Crossref REST API client
 │   └── report_generator.py            # Stage H: BibTeX, RIS & audit report generator
 │
-├── server/                            # Web application
-│   └── app.py                         # Flask web application & responsive UI
+├── server/                            # Web application & API layer
+│   ├── app.py                         # Flask application & REST API routes
+│   ├── db.py                          # SQLite database engine (users & jobs)
+│   └── templates/                     # Modern UI presentation layer
+│       └── index.html                 # Dark glassmorphic user interface
 │
+├── data/                              # SQLite database storage (git-ignored)
 ├── uploads/                           # Temporary folder for uploaded files (auto-cleaned)
 ├── outputs/                           # Generated manuscripts & reports (auto-cleaned)
 └── logs/                              # Execution logs for each conversion stage

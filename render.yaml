@@ -17,4 +17,6 @@ services:
         value: logs
       - key: CROSSREF_EMAIL
         value: citation-workflow@research-paper.org
+      - key: SECRET_KEY
+        generateValue: true
 
